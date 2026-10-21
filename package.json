@@ -1,0 +1,32 @@
+{
+  "name": "dsh-decision-review",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent decision review for DeepSeek Harness: the primary model keeps deciding, a reviewer model only advises.",
+  "type": "module",
+  "exports": "./src/decision-model.mjs",
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=20.11"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "decision",
+    "review"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "check": "node --check src/decision-core.mjs && node --check src/decision-model.mjs",
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "3.18.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/schemastery": "3.18.2"
+  }
+}
