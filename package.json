@@ -9,7 +9,8 @@
   },
   "files": [
     "src",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "README_EN.md"
   ],
   "dsh": {
     "bundle": {
