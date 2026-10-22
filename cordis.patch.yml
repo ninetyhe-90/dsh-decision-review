@@ -1,0 +1,5 @@
+- insert:
+    - id: decision-review
+      name: dsh-decision-review
+      config:
+        mode: off

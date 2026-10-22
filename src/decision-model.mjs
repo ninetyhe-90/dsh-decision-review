@@ -241,7 +241,9 @@ export function apply(ctx, rawConfig) {
 
   const logger = ctx.logger('decision-review')
 
-  if (config.promptSection) {
+  if (ctx.tools === undefined) throw new Error('decision-review requires the dsh tools service')
+
+  if (config.promptSection && ctx.systemPrompt !== undefined) {
     ctx.systemPrompt.section({
       name: 'decision:decision-review',
       order: config.promptSectionOrder,

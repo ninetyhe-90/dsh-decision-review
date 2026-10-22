@@ -7,6 +7,27 @@ The primary model produces `primaryChoice` first. The reviewer only sees the que
 its evidence, and the allowed constraints. The primary model remains the decision maker: it may
 adopt the suggestion, keep its own choice, or ask the user.
 
+## Install
+
+```sh
+dsh plugin --profile <name> add dsh-decision-review
+```
+
+The bundle installs with `mode: off`. Enable it in the profile's patch layer:
+
+```yaml
+- insert:
+    - id: decision-review
+      name: dsh-decision-review
+      config:
+        mode: advisory
+        model: your-decision-model
+        baseUrl: https://your-gateway
+```
+
+The reviewer endpoint (`POST /v1/decision`) is not provided by this package; without a compatible
+service, keep `mode: off`. Requires a DSH build exposing `ctx.tools` and `ctx.logger` (0.2.x).
+
 ## Requirements
 
 - Node.js 20.11+
