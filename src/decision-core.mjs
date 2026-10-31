@@ -31,11 +31,28 @@ const LIMITS = Object.freeze({
   constraintsTotal: 2500,
 })
 
+// 入参字段路径只由固定字段名与数组下标拼成，例如 options[1].description，不含任何入参内容。
+const FIELD_PATH_PATTERN = /^[A-Za-z][A-Za-z0-9]*(?:\[\d{1,3}\])?(?:\.[A-Za-z][A-Za-z0-9]*(?:\[\d{1,3}\])?)*$/
+
+/** 入参实际类型的粗分类，只用于诊断，不含值本身。 */
+function valueType(value) {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  return typeof value
+}
+
 export class DecisionInputError extends TypeError {
-  constructor(code, message) {
+  /**
+   * @param {string} code 稳定错误码
+   * @param {string} message 中文说明（只含字段名与上限，不含入参内容）
+   * @param {{ field?: string, actualType?: string }} [detail] 出错字段路径与实际类型，供日志和主模型纠错
+   */
+  constructor(code, message, detail = {}) {
     super(message)
     this.name = 'DecisionInputError'
     this.code = code
+    if (typeof detail.field === 'string' && FIELD_PATH_PATTERN.test(detail.field)) this.field = detail.field
+    if (typeof detail.actualType === 'string') this.actualType = detail.actualType
   }
 }
 
@@ -46,25 +63,25 @@ function requirePlainObject(value, code, field) {
     || Array.isArray(value)
     || Object.getPrototypeOf(value) !== Object.prototype
   ) {
-    throw new DecisionInputError(code, `${field} 必须是普通对象`)
+    throw new DecisionInputError(code, `${field} 必须是普通对象`, { field, actualType: valueType(value) })
   }
   return value
 }
 
-function containsSensitiveText(value) {
+export function containsSensitiveText(value) {
   return SENSITIVE_TEXT_PATTERNS.some((pattern) => pattern.test(value))
 }
 
 function requireString(value, field, maxLength, pattern) {
   if (typeof value !== 'string') {
-    throw new DecisionInputError('INVALID_STRING', `${field} 必须是字符串`)
+    throw new DecisionInputError('INVALID_STRING', `${field} 必须是字符串`, { field, actualType: valueType(value) })
   }
   const normalized = value.trim()
   if (normalized.length === 0 || normalized.length > maxLength) {
-    throw new DecisionInputError('INVALID_STRING_LENGTH', `${field} 长度必须在 1 到 ${maxLength} 之间`)
+    throw new DecisionInputError('INVALID_STRING_LENGTH', `${field} 长度必须在 1 到 ${maxLength} 之间`, { field })
   }
   if (pattern !== undefined && !pattern.test(normalized)) {
-    throw new DecisionInputError('INVALID_STRING_FORMAT', `${field} 格式不合法`)
+    throw new DecisionInputError('INVALID_STRING_FORMAT', `${field} 格式不合法`, { field })
   }
   return normalized
 }
@@ -72,11 +89,14 @@ function requireString(value, field, maxLength, pattern) {
 function optionalStringArray(value, field, maxItems, maxItemLength, totalLimit) {
   if (value === undefined) return []
   if (!Array.isArray(value) || value.length > maxItems) {
-    throw new DecisionInputError('INVALID_ARRAY', `${field} 数量不能超过 ${maxItems}`)
+    throw new DecisionInputError('INVALID_ARRAY', `${field} 数量不能超过 ${maxItems}`, {
+      field,
+      ...(Array.isArray(value) ? {} : { actualType: valueType(value) }),
+    })
   }
   const normalized = value.map((item, index) => requireString(item, `${field}[${index}]`, maxItemLength))
   if (normalized.reduce((sum, item) => sum + item.length, 0) > totalLimit) {
-    throw new DecisionInputError('ARRAY_TOO_LARGE', `${field} 超过总字符预算 ${totalLimit}`)
+    throw new DecisionInputError('ARRAY_TOO_LARGE', `${field} 超过总字符预算 ${totalLimit}`, { field })
   }
   return normalized
 }
@@ -193,13 +213,16 @@ export function normalizeDecisionInput(rawInput, rawConfig) {
   const input = requirePlainObject(rawInput, 'INVALID_INPUT', 'input')
   const point = requireString(input.point, 'point', LIMITS.point, POINT_PATTERN)
   if (!config.allowedDecisionPoints.includes(point)) {
-    throw new DecisionInputError('DECISION_POINT_NOT_ALLOWED', `决策点 ${point} 不在允许列表中`)
+    throw new DecisionInputError('DECISION_POINT_NOT_ALLOWED', `决策点 ${point} 不在允许列表中`, { field: 'point' })
   }
   const question = requireString(input.question, 'question', LIMITS.question)
   const primaryChoice = requireString(input.primaryChoice, 'primaryChoice', LIMITS.optionId, ID_PATTERN)
 
   if (!Array.isArray(input.options) || input.options.length < 2 || input.options.length > LIMITS.options) {
-    throw new DecisionInputError('INVALID_OPTIONS', `options 数量必须在 2 到 ${LIMITS.options} 之间`)
+    throw new DecisionInputError('INVALID_OPTIONS', `options 数量必须在 2 到 ${LIMITS.options} 之间`, {
+      field: 'options',
+      ...(Array.isArray(input.options) ? {} : { actualType: valueType(input.options) }),
+    })
   }
   const options = input.options.map((rawOption, index) => {
     const option = requirePlainObject(rawOption, 'INVALID_OPTION', `options[${index}]`)
@@ -220,18 +243,21 @@ export function normalizeDecisionInput(rawInput, rawConfig) {
   })
   const optionIds = options.map((option) => option.id)
   if (new Set(optionIds).size !== optionIds.length) {
-    throw new DecisionInputError('DUPLICATE_OPTION_ID', '候选 id 不能重复')
+    throw new DecisionInputError('DUPLICATE_OPTION_ID', '候选 id 不能重复', { field: 'options' })
   }
   if (!optionIds.includes(primaryChoice)) {
-    throw new DecisionInputError('INVALID_PRIMARY_CHOICE', 'primaryChoice 必须属于候选集合')
+    throw new DecisionInputError('INVALID_PRIMARY_CHOICE', 'primaryChoice 必须属于候选集合', { field: 'primaryChoice' })
   }
 
   if (input.evidence !== undefined && !Array.isArray(input.evidence)) {
-    throw new DecisionInputError('INVALID_EVIDENCE', 'evidence 必须是数组')
+    throw new DecisionInputError('INVALID_EVIDENCE', 'evidence 必须是数组', {
+      field: 'evidence',
+      actualType: valueType(input.evidence),
+    })
   }
   const rawEvidence = input.evidence ?? []
   if (rawEvidence.length > LIMITS.evidenceItems) {
-    throw new DecisionInputError('EVIDENCE_TOO_LARGE', `evidence 数量不能超过 ${LIMITS.evidenceItems}`)
+    throw new DecisionInputError('EVIDENCE_TOO_LARGE', `evidence 数量不能超过 ${LIMITS.evidenceItems}`, { field: 'evidence' })
   }
   const evidence = rawEvidence.map((rawItem, index) => {
     const item = requirePlainObject(rawItem, 'INVALID_EVIDENCE', `evidence[${index}]`)
@@ -242,19 +268,21 @@ export function normalizeDecisionInput(rawInput, rawConfig) {
   })
   const evidenceIds = evidence.map((item) => item.id)
   if (new Set(evidenceIds).size !== evidenceIds.length) {
-    throw new DecisionInputError('DUPLICATE_EVIDENCE_ID', '证据 id 不能重复')
+    throw new DecisionInputError('DUPLICATE_EVIDENCE_ID', '证据 id 不能重复', { field: 'evidence' })
   }
   if (evidence.reduce((sum, item) => sum + item.fact.length, 0) > LIMITS.evidenceTotal) {
-    throw new DecisionInputError('EVIDENCE_TOO_LARGE', `evidence 超过总字符预算 ${LIMITS.evidenceTotal}`)
+    throw new DecisionInputError('EVIDENCE_TOO_LARGE', `evidence 超过总字符预算 ${LIMITS.evidenceTotal}`, { field: 'evidence' })
   }
   const evidenceIdSet = new Set(evidenceIds)
-  for (const option of options) {
+  options.forEach((option, index) => {
     for (const ref of option.evidenceRefs) {
       if (!evidenceIdSet.has(ref)) {
-        throw new DecisionInputError('UNKNOWN_EVIDENCE_REF', `候选 ${option.id} 引用了不存在的证据 ${ref}`)
+        throw new DecisionInputError('UNKNOWN_EVIDENCE_REF', `候选 ${option.id} 引用了不存在的证据 ${ref}`, {
+          field: `options[${index}].evidenceRefs`,
+        })
       }
     }
-  }
+  })
 
   const constraints = optionalStringArray(
     input.constraints,

@@ -6,7 +6,7 @@
   <p>
     <img src="https://img.shields.io/badge/node-%3E%3D20.11-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js 20.11+" />
     <img src="https://img.shields.io/badge/DSH-0.2.x-4D6BFE?style=flat-square" alt="DSH 0.2.x" />
-    <img src="https://img.shields.io/badge/tests-50%20passed-brightgreen?style=flat-square" alt="50 tests passed" />
+    <img src="https://img.shields.io/badge/tests-73%20passed-brightgreen?style=flat-square" alt="73 tests passed" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License" /></a>
   </p>
 
@@ -50,6 +50,7 @@ flowchart LR
 | Confidence tiers | Adoptable, keep-but-not-recommended, or abstained |
 | No retries | A failed review returns immediately; the primary judgement stands |
 | Redacted logs | Point, status, reason code, model, HTTP status, request id, input fingerprint, latency |
+| Observability | One stderr line per review with `traceparent` tracing; failures distinguish "no response headers yet" from "reading the body" |
 | Permission isolation | Permissions, approvals, writes, network targets, and allowlists never reach the reviewer |
 
 ## Protocol
@@ -96,6 +97,7 @@ dsh plugin --profile <name> add github:ninetyhe-90/dsh-decision-review
 | `promptSection` | `boolean` | `true` | Inject the prompt section |
 | `promptSectionOrder` | `number` | `30` | Prompt section order |
 | `systemExtra` | `string` | empty | Extra domain constraints |
+| `requestIdFile` | `string` | empty | Optional file the host writes per turn; its content becomes `requestId` in logs for correlation |
 
 ```yaml
 - insert:
@@ -124,6 +126,40 @@ dsh plugin --profile <name> add github:ninetyhe-90/dsh-decision-review
 | `invalid_response` / `response_too_large` | Unparsable or oversized response |
 | `provider_error` | Any other network or server failure |
 
+## Logging and diagnostics
+
+Review events go through the host logger named `decision-review`, and the plugin also registers an
+exporter that writes one line per event to stderr:
+
+```text
+DECISION_REVIEW {"level":"info","msg":"decision review","status":"unavailable","reasonCode":"timeout","requestId":"64d1c9b1-...","toolCallId":"call_...","latencyMs":10012,...}
+```
+
+- The exporter declares `levels` as `{ 'decision-review': 2, default: -1 }`; without it cordis
+  filters at the INFO threshold and drops warn, while `default: -1` keeps other plugins' logs out.
+  When the host has no `ctx.logger.exporter`, the export is skipped and everything else still works.
+- One line per success, per failure, and per rejected input; fields match the logger event and never
+  contain request content, candidate descriptions, or credentials.
+- Every review sends a W3C `traceparent` and logs its `traceId`. A timed-out call returns no response,
+  so no HTTP status exists and `traceId` is the only thing to reconcile against the gateway. When the
+  gateway echoes `x-platform-trace-id` / `x-trace-context-status`, they are logged as
+  `platformTraceId` / `traceContextStatus`; matching `traceId` with a status other than `generated`
+  means the gateway adopted the trace.
+- Failure lines carry `stage`: `request` means the call never received response headers (connect,
+  queue, and model inference all live there), `response_body` means headers arrived and the body was
+  being read. Header arrival adds `headersMs`, timeouts add `timeoutMs`, and network failures add the
+  error class name `errorName` plus `errorCode` (for example `ECONNRESET`) without the message.
+- Rejected input carries `field` (such as `options[1].description`) and `actualType` (such as
+  `undefined` or `object`) — a fixed field path and a type name only; the text returned to the primary
+  model repeats the field path so a corrected retry is possible.
+- DSH does not validate `parameters`, but host hooks, approvals, and guards can reject a call before
+  `execute`, and non-input exceptions or output-schema failures inside `execute` never reach the review
+  log. The plugin subscribes to `tools/result` and appends a warn line `decision review tool failed`
+  for every `isError` receipt of this tool: `stage` is `before_execute`, `execute`, or `after_execute`,
+  `errorCode` comes from the error info code, and `summary` is the first line of the error text
+  (`Error: ` stripped, 200 characters at most, whole line `[redacted]` when it looks like a credential).
+- An outer process only needs to read stderr line by line and match the `DECISION_REVIEW ` prefix.
+
 ## Security boundaries
 
 - The reviewer receives no tools, files, network access, or approval rights.
@@ -134,7 +170,8 @@ dsh plugin --profile <name> add github:ninetyhe-90/dsh-decision-review
 ## Compatibility
 
 - Node.js 20.11+
-- DeepSeek Harness 0.2.x (`ctx.tools`, `ctx.logger`; optional `ctx.systemPrompt`)
+- DeepSeek Harness 0.2.x (`ctx.tools`, `ctx.logger`; optional `ctx.systemPrompt`; without
+  `ctx.logger.exporter` or `ctx.on`, stderr logging and `tools/result` failure logging are skipped)
 - `@deepseek-ai/schemastery` 3.18.x
 
 ## Layout
@@ -158,6 +195,7 @@ npm run check
 
 - [x] Three modes and confidence tiers
 - [x] Structured failure codes and redacted logs
+- [x] Per-line stderr logs, `traceparent` tracing, and failure stages
 - [x] Configurable decision point allowlist
 - [x] Bundle packaging
 - [ ] npm release

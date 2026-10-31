@@ -6,7 +6,7 @@
   <p>
     <img src="https://img.shields.io/badge/node-%3E%3D20.11-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js 20.11+" />
     <img src="https://img.shields.io/badge/DSH-0.2.x-4D6BFE?style=flat-square" alt="DSH 0.2.x" />
-    <img src="https://img.shields.io/badge/tests-50%20passed-brightgreen?style=flat-square" alt="50 tests passed" />
+    <img src="https://img.shields.io/badge/tests-73%20passed-brightgreen?style=flat-square" alt="73 tests passed" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License" /></a>
   </p>
 
@@ -46,6 +46,7 @@ flowchart LR
 | 置信度分层 | 达标可采纳、未达标保留、过低视为弃权 |
 | 失败不重试 | 复核失败立即返回原因，主模型按原判断继续 |
 | 日志脱敏 | 只记录点位、状态、原因码、模型、HTTP 状态、请求 id、输入指纹与耗时 |
+| 可观测性 | 每次复核写一行 stderr，带 traceparent 追踪；失败区分「未拿到响应头 / 读响应体」两段 |
 | 权限隔离 | 权限、审批、写操作、网络目标、工具白名单永不交给复核方 |
 
 ## 复核协议
@@ -93,6 +94,7 @@ dsh plugin --profile <name> add github:ninetyhe-90/dsh-decision-review
 | `promptSection` | `boolean` | `true` | 是否注入提示段 |
 | `promptSectionOrder` | `number` | `30` | 提示段顺序 |
 | `systemExtra` | `string` | 空 | 追加到复核请求的领域约束 |
+| `requestIdFile` | `string` | 空 | 可选：宿主每轮写入的轮次标识文件，内容会作为 `requestId` 写进日志，用于和宿主日志对齐 |
 
 ```yaml
 - insert:
@@ -123,6 +125,22 @@ dsh plugin --profile <name> add github:ninetyhe-90/dsh-decision-review
 | `invalid_response` / `response_too_large` | 响应无法解析或超出上限 |
 | `provider_error` | 其它网络或服务端错误 |
 
+## 日志与诊断
+
+复核事件经宿主 logger（名称 `decision-review`）输出，同时由插件注册的 exporter 逐行写到 stderr：
+
+```text
+DECISION_REVIEW {"level":"info","msg":"decision review","status":"unavailable","reasonCode":"timeout","requestId":"64d1c9b1-...","toolCallId":"call_...","latencyMs":10012,...}
+```
+
+- exporter 的 `levels` 显式声明为 `{ 'decision-review': 2, default: -1 }`：不声明时 cordis 按 INFO 阈值过滤，warn 会被丢弃；`default: -1` 保证其他插件的日志不会经这里输出。宿主未提供 `ctx.logger.exporter` 时自动跳过，其它功能不受影响。
+- 成功、失败、入参被拒各写一行；字段与 logger 事件相同，不含请求内容、候选描述或凭据。
+- 每次复核生成一个 W3C `traceparent` 随请求发出，日志记 `traceId`。超时时上游没有返回响应，没有 HTTP 状态可查，`traceId` 是到网关侧对账的唯一凭据。网关若回传 `x-platform-trace-id` / `x-trace-context-status`，分别记为 `platformTraceId` / `traceContextStatus`：与 `traceId` 一致且状态不为 `generated`，说明网关采纳了该 trace。
+- 失败行带 `stage`：`request` 表示还没拿到响应头（连接、排队、模型推理都在这一段），`response_body` 表示已拿到响应头、正在读响应体；拿到响应头时另记 `headersMs`，超时另记 `timeoutMs`，网络层失败另记错误类名 `errorName` 与错误码 `errorCode`（如 `ECONNRESET`），不记 message。
+- 入参被拒（`rejected`）带 `field`（如 `options[1].description`）与 `actualType`（如 `undefined` / `object`），只是固定字段路径与类型名；返回给主模型的文本也附上字段路径，便于修正后重试。
+- DSH 不按 `parameters` 校验入参，但宿主钩子、审批、guard 会在 `execute` 之前拒绝调用，`execute` 抛出的非入参异常与返回值校验失败也不经过复核日志。插件订阅 `tools/result`，对本工具每个 `isError` 回执补写一行 warn `decision review tool failed`：`stage` 为 `before_execute` / `execute` / `after_execute`，`errorCode` 取自错误信息的 code，`summary` 是错误文本首行（去掉 `Error: ` 前缀，最多 200 字符，疑似凭据整行替换为 `[redacted]`）。
+- 外层进程只需逐行读取 stderr 并按 `DECISION_REVIEW ` 前缀识别即可收集这些事件。
+
 ## 安全边界
 
 - 复核方不获得任何工具、文件、网络或审批权限。
@@ -133,7 +151,7 @@ dsh plugin --profile <name> add github:ninetyhe-90/dsh-decision-review
 ## 兼容性
 
 - Node.js 20.11+
-- DeepSeek Harness 0.2.x：需要 `ctx.tools`、`ctx.logger`；缺少 `ctx.systemPrompt` 时跳过提示段注入
+- DeepSeek Harness 0.2.x：需要 `ctx.tools`、`ctx.logger`；缺少 `ctx.systemPrompt` 时跳过提示段注入，缺少 `ctx.logger.exporter` 或 `ctx.on` 时跳过 stderr 日志与 `tools/result` 失败补记
 - `@deepseek-ai/schemastery` 3.18.x
 
 ## 项目结构
@@ -157,6 +175,7 @@ npm run check
 
 - [x] 三档模式与置信度分层
 - [x] 结构化失败码与日志脱敏
+- [x] stderr 逐行日志、traceparent 追踪与失败阶段区分
 - [x] 可配置决策点白名单
 - [x] bundle 安装形式
 - [ ] npm 发布

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import * as plugin from '../src/decision-model.mjs'
@@ -67,10 +70,33 @@ function stubFetch(impl) {
   return { calls, restore: () => { globalThis.fetch = original } }
 }
 
+// 与 cordis LoggerService 相同的分发规则：exporter 按 levels[name] ?? levels.default ?? INFO 过滤。
+const LOGGER_LEVEL = { error: 0, info: 1, warn: 2, debug: 3 }
+
 function createContext() {
   const sections = []
   const tools = new Map()
   const logs = []
+  const exporters = []
+  const logger = (loggerName) => {
+    const method = (type) => (...args) => {
+      logs.push({ level: type, format: args[0], value: args[1] })
+      for (const exporter of exporters) {
+        const target = exporter.levels?.[loggerName] ?? exporter.levels?.default ?? LOGGER_LEVEL.info
+        if (target < LOGGER_LEVEL[type]) continue
+        exporter.export({ name: loggerName, type, level: LOGGER_LEVEL[type], args, ts: Date.now() })
+      }
+    }
+    return { info: method('info'), warn: method('warn'), error: method('error'), debug: method('debug') }
+  }
+  logger.exporter = (exporter) => {
+    exporters.push(exporter)
+    return () => exporters.splice(exporters.indexOf(exporter), 1)
+  }
+  const listeners = new Map()
+  const emit = (eventName, ...args) => {
+    for (const listener of listeners.get(eventName) ?? []) listener(...args)
+  }
   const ctx = {
     systemPrompt: {
       section(value) {
@@ -83,29 +109,37 @@ function createContext() {
         return () => tools.delete(definition.name)
       },
     },
-    logger() {
-      return {
-        info(format, value) {
-          logs.push({ level: 'info', format, value })
-        },
-        warn(format, value) {
-          logs.push({ level: 'warn', format, value })
-        },
-        error() {},
-        debug() {},
-      }
+    on(eventName, listener) {
+      if (!listeners.has(eventName)) listeners.set(eventName, [])
+      listeners.get(eventName).push(listener)
+      return () => listeners.get(eventName).splice(listeners.get(eventName).indexOf(listener), 1)
     },
+    logger,
   }
-  return { ctx, sections, tools, logs }
+  return { ctx, sections, tools, logs, exporters, logger, listeners, emit }
+}
+
+function stderrRecords(lines) {
+  return lines.map((line) => {
+    assert.ok(line.startsWith(plugin.STDERR_LOG_PREFIX), line)
+    assert.ok(line.endsWith('\n'), line)
+    assert.equal(line.slice(0, -1).includes('\n'), false, line)
+    return JSON.parse(line.slice(plugin.STDERR_LOG_PREFIX.length))
+  })
 }
 
 async function executeWith(fetchImpl, pluginConfig, args = validArgs, exec = {}) {
   const state = createContext()
+  state.stderr = []
   const stub = stubFetch(fetchImpl)
   const keyBackup = process.env.DECISION_API_KEY
   process.env.DECISION_API_KEY = 'test-key'
   try {
-    plugin.apply(state.ctx, pluginConfig)
+    plugin.apply(state.ctx, {
+      write: (line) => state.stderr.push(line),
+      readTurnId: () => undefined,
+      ...pluginConfig,
+    })
     const tool = state.tools.get(plugin.toolName)
     assert.ok(tool)
     return { state, result: await tool.execute(args, exec), tool, calls: stub.calls }
@@ -116,7 +150,7 @@ async function executeWith(fetchImpl, pluginConfig, args = validArgs, exec = {})
   }
 }
 
-test('导出固定内部工具名和可解析配置', () => {
+test('导出固定工具名和可解析配置', () => {
   assert.equal(plugin.name, 'decision-review')
   assert.equal(plugin.toolName, '__decision_review')
   assert.deepEqual(plugin.inject, ['tools', 'systemPrompt'])
@@ -290,12 +324,14 @@ test('缺少 API key 时不分发请求', async () => {
   const keyBackup = process.env.DECISION_API_KEY
   delete process.env.DECISION_API_KEY
   try {
-    plugin.apply(state.ctx, config())
+    const stderr = []
+    plugin.apply(state.ctx, { ...config(), write: (line) => stderr.push(line), readTurnId: () => undefined })
     const tool = state.tools.get(plugin.toolName)
     const result = await tool.execute(validArgs, {})
     assert.equal(result.status, 'unavailable')
     assert.equal(result.reasonCode, 'credential_unavailable')
     assert.equal(stub.calls.length, 0)
+    assert.equal(stderrRecords(stderr).at(-1).reasonCode, 'credential_unavailable')
   } finally {
     stub.restore()
     if (keyBackup === undefined) delete process.env.DECISION_API_KEY
@@ -479,4 +515,275 @@ test('日志包含模型路由与输入指纹，不包含请求内容', async ()
   assert.equal(event.options, 2)
   assert.equal(event.evidenceItems, 2)
   assert.equal(JSON.stringify(event).includes('财务确认口径'), false)
+})
+
+test('提示词要求在向用户提问前完成复核', () => {
+  const state = createContext()
+  plugin.apply(state.ctx, config())
+  assert.match(state.sections[0].text, /已经向用户提问后不要再调用本工具/)
+})
+
+test('注册的 stderr exporter 只收本插件的 error / info / warn', () => {
+  const state = createContext()
+  plugin.apply(state.ctx, { ...config(), write: () => {}, readTurnId: () => undefined })
+  assert.equal(state.exporters.length, 1)
+  const { levels } = state.exporters[0]
+  assert.equal(levels[plugin.name], LOGGER_LEVEL.warn)
+  assert.ok(levels.default < LOGGER_LEVEL.error)
+})
+
+test('off 模式不注册 stderr exporter', () => {
+  const state = createContext()
+  plugin.apply(state.ctx, { mode: 'off' })
+  assert.equal(state.exporters.length, 0)
+})
+
+test('成功复核写一行 stderr，带网关 requestId 与 toolCallId', async () => {
+  const headers = { 'x-gateway-request-id': 'req-0123456789', 'x-gateway-call-id': 'gwc_abcdef12' }
+  const { state } = await executeWith(
+    async () => jsonResponse(decisionOk(), 200, headers),
+    config({ readTurnId: () => '64d1c9b1-e648-412b-8524-9647399fb125\n' }),
+    validArgs,
+    { callId: 'call_01bf1efe7b604199a1fc4c93' },
+  )
+  const records = stderrRecords(state.stderr)
+  assert.equal(records.length, 1)
+  const [record] = records
+  assert.equal(record.level, 'info')
+  assert.equal(record.msg, 'decision review')
+  assert.equal(record.status, 'ok')
+  assert.equal(record.requestId, '64d1c9b1-e648-412b-8524-9647399fb125')
+  assert.equal(record.toolCallId, 'call_01bf1efe7b604199a1fc4c93')
+  assert.equal(record.gatewayRequestId, 'req-0123456789')
+  assert.equal(record.gatewayCallId, 'gwc_abcdef12')
+  assert.equal(typeof record.latencyMs, 'number')
+  assert.equal(JSON.stringify(record).includes('财务确认口径'), false)
+  assert.equal(JSON.stringify(record).includes('test-key'), false)
+})
+
+test('网关报错写一行 stderr，带 httpStatus 与 gatewayCode', async () => {
+  const { state } = await executeWith(async () => gatewayError(504, 'UPSTREAM_TIMEOUT'), config())
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.status, 'unavailable')
+  assert.equal(record.reasonCode, 'upstream_timeout')
+  assert.equal(record.httpStatus, 504)
+  assert.equal(record.gatewayCode, 'UPSTREAM_TIMEOUT')
+  assert.equal(JSON.stringify(record).includes('secret upstream message'), false)
+})
+
+test('本地超时写一行 stderr，reasonCode=timeout 且带耗时', { timeout: 1000 }, async () => {
+  const { state } = await executeWith(
+    async () => new Promise(() => {}),
+    config({ timeoutMs: 100 }),
+    validArgs,
+    { callId: 'call_timeout_1' },
+  )
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.status, 'unavailable')
+  assert.equal(record.reasonCode, 'timeout')
+  assert.equal(record.toolCallId, 'call_timeout_1')
+  assert.ok(record.latencyMs >= 100)
+})
+
+test('入参被拒按 warn 写一行 stderr', async () => {
+  const args = { ...validArgs, question: '使用 Authorization: Bearer abcdefghijklmnop 判断' }
+  const { state } = await executeWith(async () => jsonResponse(decisionOk()), config(), args, { callId: 'call_rejected_1' })
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.level, 'warn')
+  assert.equal(record.msg, 'decision review rejected')
+  assert.equal(record.status, 'rejected')
+  assert.equal(record.reasonCode, 'SENSITIVE_INPUT')
+  assert.equal(record.toolCallId, 'call_rejected_1')
+  assert.equal(JSON.stringify(record).includes('abcdefghijklmnop'), false)
+})
+
+test('非法 requestId / callId 不进日志', async () => {
+  const { state } = await executeWith(
+    async () => jsonResponse(decisionOk()),
+    config({ readTurnId: () => 'bad id\nINJECT' }),
+    validArgs,
+    { callId: '-leading-dash' },
+  )
+  const [record] = stderrRecords(state.stderr)
+  assert.equal('requestId' in record, false)
+  assert.equal('toolCallId' in record, false)
+})
+
+test('stderr exporter 忽略其他插件的日志', () => {
+  const lines = []
+  const exporter = plugin.createStderrExporter((line) => lines.push(line))
+  exporter.export({ name: 'other-plugin', type: 'info', level: 1, args: ['hello %o', { a: 1 }] })
+  assert.equal(lines.length, 0)
+  exporter.export({ name: plugin.name, type: 'error', level: 0, args: ['decision review %o', { status: 'unavailable' }] })
+  assert.deepEqual(stderrRecords(lines), [{ level: 'error', msg: 'decision review', status: 'unavailable' }])
+})
+
+test('每次复核发出 traceparent 并把 traceId 与网关回传的 trace 头写进日志', async () => {
+  const headers = { 'x-platform-trace-id': 'feedc0de', 'x-trace-context-status': 'propagated' }
+  const { state, calls } = await executeWith(async () => jsonResponse(decisionOk(), 200, headers), config())
+  const traceparent = calls[0].options.headers.traceparent
+  const match = /^00-([0-9a-f]{32})-([0-9a-f]{16})-01$/.exec(traceparent)
+  assert.ok(match, traceparent)
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.traceId, match[1])
+  assert.equal(record.platformTraceId, 'feedc0de')
+  assert.equal(record.traceContextStatus, 'propagated')
+  assert.equal(typeof record.headersMs, 'number')
+
+  const second = await executeWith(async () => jsonResponse(decisionOk()), config())
+  assert.notEqual(second.calls[0].options.headers.traceparent, traceparent)
+})
+
+test('等待响应头时超时：stage=request，带 timeoutMs 与 traceId', { timeout: 1000 }, async () => {
+  const { state } = await executeWith(async () => new Promise(() => {}), config({ timeoutMs: 100 }))
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.reasonCode, 'timeout')
+  assert.equal(record.stage, 'request')
+  assert.equal(record.timeoutMs, 100)
+  assert.match(record.traceId, /^[0-9a-f]{32}$/)
+  assert.equal('headersMs' in record, false)
+})
+
+test('读响应体时超时：stage=response_body，带 headersMs', { timeout: 1000 }, async () => {
+  const { state } = await executeWith(
+    async () => new Response(new ReadableStream({ start() {} }), { status: 500 }),
+    config({ timeoutMs: 100 }),
+  )
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.reasonCode, 'timeout')
+  assert.equal(record.stage, 'response_body')
+  assert.equal(typeof record.headersMs, 'number')
+})
+
+test('网络层失败记录错误类名与错误码，不记录 message', async () => {
+  const { result, state } = await executeWith(async () => {
+    throw new TypeError('fetch failed http://10.0.0.1/secret', { cause: { code: 'ECONNRESET' } })
+  }, config())
+  assert.equal(result.reasonCode, 'provider_error')
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.stage, 'request')
+  assert.equal(record.errorName, 'TypeError')
+  assert.equal(record.errorCode, 'ECONNRESET')
+  assert.equal(JSON.stringify(record).includes('10.0.0.1'), false)
+  assert.equal('timeoutMs' in record, false)
+})
+
+test('入参被拒时日志与返回值带字段路径和实际类型，主模型可据此修正', async () => {
+  const args = { ...validArgs, constraints: [{ text: '候选必须符合用户明确口径' }] }
+  const { result, state, tool } = await executeWith(async () => jsonResponse(decisionOk()), config(), args)
+  assert.equal(result.status, 'rejected')
+  assert.equal(result.reasonCode, 'INVALID_STRING')
+  assert.equal(result.field, 'constraints[0]')
+  const [record] = stderrRecords(state.stderr)
+  assert.equal(record.field, 'constraints[0]')
+  assert.equal(record.actualType, 'object')
+  assert.equal(JSON.stringify(record).includes('候选必须符合'), false)
+  const rendered = tool.output.render({}, result)[0].text
+  assert.match(rendered, /错误码：INVALID_STRING（字段 constraints\[0\]/)
+})
+
+test('宿主在 execute 之前拒绝调用时补写一行 failed 日志（stage=before_execute）', async () => {
+  const state = createContext()
+  const stderr = []
+  plugin.apply(state.ctx, { ...config(), write: (line) => stderr.push(line), readTurnId: () => 'turn-1' })
+  const denial = 'HOST_GATE_DENY {"tool":"__decision_review","reason":"turn_suspended_on_question","argumentsHash":null}'
+  state.emit('tools/result', { name: plugin.toolName, callId: 'call_denied_1' }, {
+    isError: true,
+    content: [{ type: 'text', text: `Error: ${denial}\n本轮已经向用户提问并挂起` }],
+    error: { message: `${denial}\n本轮已经向用户提问并挂起` },
+  })
+  const [record] = stderrRecords(stderr)
+  assert.equal(record.level, 'warn')
+  assert.equal(record.msg, 'decision review tool failed')
+  assert.equal(record.status, 'failed')
+  assert.equal(record.stage, 'before_execute')
+  assert.equal(record.summary, denial)
+  assert.equal(record.requestId, 'turn-1')
+  assert.equal(record.toolCallId, 'call_denied_1')
+})
+
+test('失败摘要疑似含凭据时整行替换，错误码按标识符过滤', () => {
+  const state = createContext()
+  const stderr = []
+  plugin.apply(state.ctx, { ...config(), write: (line) => stderr.push(line), readTurnId: () => undefined })
+  state.emit('tools/result', { name: plugin.toolName, callId: 'call_x' }, {
+    isError: true,
+    content: [],
+    error: { message: 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz', info: { name: 'X', code: 'BAD CODE\nINJECT' } },
+  })
+  state.emit('tools/result', { name: plugin.toolName, callId: 'call_y' }, {
+    isError: true,
+    content: [],
+    error: { message: 'tool aborted', info: { name: 'HarnessError', code: 'ABORTED_BEFORE_DISPATCH' } },
+  })
+  const [redacted, aborted] = stderrRecords(stderr)
+  assert.equal(redacted.summary, '[redacted]')
+  assert.equal('errorCode' in redacted, false)
+  assert.equal(aborted.errorCode, 'ABORTED_BEFORE_DISPATCH')
+  assert.equal(aborted.summary, 'tool aborted')
+})
+
+test('其他工具与成功回执不产生 failed 日志；复核后回执失败记为 after_execute', async () => {
+  const { state } = await executeWith(async () => jsonResponse(decisionOk()), config(), validArgs, { callId: 'call_ok_1' })
+  state.emit('tools/result', { name: 'bash', callId: 'call_bash' }, { isError: true, content: [], error: { message: 'x' } })
+  state.emit('tools/result', { name: plugin.toolName, callId: 'call_ok_1' }, { isError: false, content: [] })
+  assert.equal(stderrRecords(state.stderr).length, 1)
+
+  const again = await executeWith(async () => jsonResponse(decisionOk()), config(), validArgs, { callId: 'call_ok_2' })
+  again.state.emit('tools/result', { name: plugin.toolName, callId: 'call_ok_2' }, {
+    isError: true,
+    content: [],
+    error: { message: 'tool "__decision_review" returned invalid output', info: { code: 'INVALID_TOOL_OUTPUT' } },
+  })
+  const records = stderrRecords(again.state.stderr)
+  assert.equal(records.length, 2)
+  assert.equal(records[1].stage, 'after_execute')
+  assert.equal(records[1].errorCode, 'INVALID_TOOL_OUTPUT')
+})
+
+test('execute 内抛出非入参异常时回执记为 stage=execute', async () => {
+  const state = createContext()
+  const stderr = []
+  plugin.apply(state.ctx, { ...config(), write: (line) => stderr.push(line), readTurnId: () => undefined })
+  const tool = state.tools.get(plugin.toolName)
+  const args = { ...validArgs }
+  Object.defineProperty(args, 'point', { enumerable: true, get() { throw new Error('boom') } })
+  await assert.rejects(tool.execute(args, { callId: 'call_throw_1' }), /boom/)
+  state.emit('tools/result', { name: plugin.toolName, callId: 'call_throw_1' }, {
+    isError: true,
+    content: [],
+    error: { message: 'boom' },
+  })
+  const [record] = stderrRecords(stderr)
+  assert.equal(record.stage, 'execute')
+  assert.equal(record.summary, 'boom')
+})
+
+test('读取轮次标识抛错不影响复核', async () => {
+  const { result, state } = await executeWith(
+    async () => jsonResponse(decisionOk()),
+    config({ readTurnId: () => { throw new Error('io') } }),
+  )
+  assert.equal(result.status, 'ok')
+  assert.equal('requestId' in stderrRecords(state.stderr)[0], false)
+})
+
+test('requestIdFile 配置时从文件读取轮次标识', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'decision-review-'))
+  const file = join(directory, 'turn.id')
+  writeFileSync(file, 'turn-from-file\n')
+  const state = createContext()
+  state.stderr = []
+  const stub = stubFetch(async () => jsonResponse(decisionOk()))
+  try {
+    plugin.apply(state.ctx, { ...config({ requestIdFile: file }), write: (line) => state.stderr.push(line) })
+    const tool = state.tools.get(plugin.toolName)
+    await tool.execute(validArgs, { callId: 'call_file_1' })
+    const [record] = stderrRecords(state.stderr)
+    assert.equal(record.requestId, 'turn-from-file')
+    assert.equal(record.toolCallId, 'call_file_1')
+  } finally {
+    stub.restore()
+    rmSync(directory, { recursive: true, force: true })
+  }
 })

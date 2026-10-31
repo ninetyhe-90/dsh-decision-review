@@ -1,6 +1,6 @@
 {
   "name": "dsh-decision-review",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Independent decision review for DeepSeek Harness: the primary model keeps deciding, a reviewer model only advises.",
   "type": "module",
   "main": "./src/decision-model.mjs",

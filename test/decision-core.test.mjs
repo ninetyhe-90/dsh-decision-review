@@ -177,8 +177,45 @@ test('拒绝超过证据预算的输入', () => {
 test('拒绝疑似包含凭据的外发内容', () => {
   assert.throws(
     () => normalizeDecisionInput({ ...baseInput, question: '使用 Authorization: Bearer abcdefghijklmnop 做判断' }, baseConfig),
-    (error) => error instanceof DecisionInputError && error.code === 'SENSITIVE_INPUT',
+    (error) => error instanceof DecisionInputError && error.code === 'SENSITIVE_INPUT' && error.field === undefined,
   )
+})
+
+test('入参错误带出错字段路径与实际类型，不带入参内容', () => {
+  const cases = [
+    [{ ...baseInput, options: [baseInput.options[0], { id: 'metric_b' }] }, 'INVALID_STRING', 'options[1].description', 'undefined'],
+    [{ ...baseInput, evidence: ['裸字符串证据'] }, 'INVALID_EVIDENCE', 'evidence[0]', 'string'],
+    [{ ...baseInput, evidence: { id: 'E1' } }, 'INVALID_EVIDENCE', 'evidence', 'object'],
+    [{ ...baseInput, options: 'metric_a' }, 'INVALID_OPTIONS', 'options', 'string'],
+    [{ ...baseInput, primaryChoice: 'metric_c' }, 'INVALID_PRIMARY_CHOICE', 'primaryChoice', undefined],
+    [{ ...baseInput, primaryChoice: '中文' }, 'INVALID_STRING_FORMAT', 'primaryChoice', undefined],
+    [{ ...baseInput, constraints: 'x' }, 'INVALID_ARRAY', 'constraints', 'string'],
+  ]
+  for (const [input, code, field, actualType] of cases) {
+    assert.throws(
+      () => normalizeDecisionInput(input, baseConfig),
+      (error) => {
+        assert.ok(error instanceof DecisionInputError, code)
+        assert.equal(error.code, code)
+        assert.equal(error.field, field, code)
+        assert.equal(error.actualType, actualType, code)
+        return true
+      },
+    )
+  }
+})
+
+test('未知证据引用定位到具体候选', () => {
+  const options = [baseInput.options[0], { ...baseInput.options[1], evidenceRefs: ['E9'] }]
+  assert.throws(
+    () => normalizeDecisionInput({ ...baseInput, options }, baseConfig),
+    (error) => error.code === 'UNKNOWN_EVIDENCE_REF' && error.field === 'options[1].evidenceRefs',
+  )
+})
+
+test('非法字段路径不会挂到错误上', () => {
+  const error = new DecisionInputError('X', 'x', { field: 'a b\nINJECT' })
+  assert.equal(error.field, undefined)
 })
 
 test('构造的 decision API 请求映射 state、criteria 与 instructions', () => {
